@@ -34,7 +34,7 @@ jobs:
           ZIP_FILE="${ZIP_FILE#./}"
 
           echo "Selected ZIP: $ZIP_FILE"
-          echo "ZIP_FILE=$ZIP_FILE" >> $GITHUB_ENV
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
 
       - name: Unzip source
         shell: bash
@@ -46,7 +46,7 @@ jobs:
 
           unzip -q "$ZIP_FILE" -d extracted_project
 
-          echo "Extracted:"
+          echo "Extracted files:"
           find extracted_project -maxdepth 3 -type f | head -n 80
 
       - name: Locate Flutter project
@@ -64,7 +64,7 @@ jobs:
           PROJECT_DIR=$(dirname "$PUBSPEC_PATH")
 
           echo "Flutter project found: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Patch Android JVM target
         shell: bash
@@ -78,58 +78,47 @@ jobs:
             exit 1
           fi
 
-          echo "Patching JVM target in: $APP_GRADLE"
+          echo "Patching: $APP_GRADLE"
 
-          python3 <<'PY'
-import os
-import re
-from pathlib import Path
+          sed -i 's/JavaVersion.VERSION_1_8/JavaVersion.VERSION_17/g' "$APP_GRADLE"
+          sed -i 's/jvmTarget = "1.8"/jvmTarget = "17"/g' "$APP_GRADLE"
+          sed -i "s/jvmTarget = '1.8'/jvmTarget = '17'/g" "$APP_GRADLE"
+          sed -i 's/jvmTarget = "11"/jvmTarget = "17"/g' "$APP_GRADLE"
+          sed -i "s/jvmTarget = '11'/jvmTarget = '17'/g" "$APP_GRADLE"
 
-project_dir = Path(os.environ["PROJECT_DIR"])
-app_gradle = project_dir / "android" / "app" / "build.gradle"
+          if ! grep -q "compileOptions" "$APP_GRADLE"; then
+            awk '
+              /android[[:space:]]*\{/ && added == 0 {
+                print
+                print "    compileOptions {"
+                print "        sourceCompatibility JavaVersion.VERSION_17"
+                print "        targetCompatibility JavaVersion.VERSION_17"
+                print "    }"
+                added = 1
+                next
+              }
+              { print }
+            ' "$APP_GRADLE" > "$APP_GRADLE.tmp"
+            mv "$APP_GRADLE.tmp" "$APP_GRADLE"
+          fi
 
-text = app_gradle.read_text(encoding="utf-8")
+          if ! grep -q "kotlinOptions" "$APP_GRADLE"; then
+            awk '
+              /android[[:space:]]*\{/ && added == 0 {
+                print
+                print "    kotlinOptions {"
+                print "        jvmTarget = \"17\""
+                print "    }"
+                added = 1
+                next
+              }
+              { print }
+            ' "$APP_GRADLE" > "$APP_GRADLE.tmp"
+            mv "$APP_GRADLE.tmp" "$APP_GRADLE"
+          fi
 
-text = text.replace("JavaVersion.VERSION_1_8", "JavaVersion.VERSION_17")
-text = text.replace("sourceCompatibility = 1.8", "sourceCompatibility = JavaVersion.VERSION_17")
-text = text.replace("targetCompatibility = 1.8", "targetCompatibility = JavaVersion.VERSION_17")
-text = text.replace("sourceCompatibility 1.8", "sourceCompatibility JavaVersion.VERSION_17")
-text = text.replace("targetCompatibility 1.8", "targetCompatibility JavaVersion.VERSION_17")
-
-text = re.sub(r'jvmTarget\s*=\s*["\']1\.8["\']', 'jvmTarget = "17"', text)
-text = re.sub(r'jvmTarget\s*=\s*["\']11["\']', 'jvmTarget = "17"', text)
-text = re.sub(r'jvmTarget\s*=\s*["\']17["\']', 'jvmTarget = "17"', text)
-
-if "compileOptions" not in text:
-    text = re.sub(
-        r'android\s*\{',
-        '''android {
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
-    }
-''',
-        text,
-        count=1
-    )
-
-if "kotlinOptions" not in text:
-    text = re.sub(
-        r'android\s*\{',
-        '''android {
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-''',
-        text,
-        count=1
-    )
-
-app_gradle.write_text(text, encoding="utf-8")
-
-print("---- patched android/app/build.gradle ----")
-print(app_gradle.read_text(encoding="utf-8"))
-PY
+          echo "Patched build.gradle:"
+          cat "$APP_GRADLE"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -162,16 +151,12 @@ PY
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          flutter build apk --release --no-shrink \
-            --build-name=1.0.0 \
-            --build-number=1
+          flutter build apk --release --no-shrink --build-name=1.0.0 --build-number=1
 
       - name: Build AAB
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          flutter build appbundle --release --no-shrink \
-            --build-name=1.0.0 \
-            --build-number=1
+          flutter build appbundle --release --no-shrink --build-name=1.0.0 --build-number=1
 
       - name: Collect outputs
         shell: bash
@@ -189,6 +174,7 @@ PY
           cp "$APK_PATH" "release_outputs/${ZIP_BASE}-release.apk"
           cp "$AAB_PATH" "release_outputs/${ZIP_BASE}-release.aab"
 
+          echo "Final outputs:"
           ls -lh release_outputs
 
       - name: Upload outputs
