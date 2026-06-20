@@ -1,0 +1,193 @@
+name: Build Latest Flutter ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: "Optional: exact ZIP filename. Leave empty to auto-pick latest committed ZIP."
+        required: false
+        default: ""
+      build_name:
+        description: "App version name"
+        required: false
+        default: "1.0.0"
+      build_number:
+        description: "App version code"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build APK and AAB from latest ZIP
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Find ZIP file
+        id: find_zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INPUT_ZIP="${{ github.event.inputs.zip_name }}"
+
+          if [ -n "$INPUT_ZIP" ]; then
+            if [ ! -f "$INPUT_ZIP" ]; then
+              echo "Requested ZIP not found: $INPUT_ZIP"
+              exit 1
+            fi
+            ZIP_FILE="$INPUT_ZIP"
+          else
+            ZIP_FILE="$(
+              git ls-files '*.zip' \
+                | while read -r file; do
+                    ts="$(git log -1 --format=%ct -- "$file" || echo 0)"
+                    printf '%s\t%s\n' "$ts" "$file"
+                  done \
+                | sort -nr \
+                | head -n 1 \
+                | cut -f2-
+            )"
+
+            if [ -z "$ZIP_FILE" ]; then
+              echo "No ZIP file found in repository."
+              exit 1
+            fi
+          fi
+
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+
+          echo "Selected ZIP: $ZIP_FILE"
+
+      - name: Prepare extraction directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf extracted_project
+          mkdir -p extracted_project
+
+      - name: Unzip selected source
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -q "$ZIP_FILE" -d extracted_project
+
+          echo "Extracted files:"
+          find extracted_project -maxdepth 3 -type f | sed 's#^#- #' | head -n 80
+
+      - name: Locate Flutter project
+        id: locate_project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBSPEC_PATH="$(
+            find extracted_project -name pubspec.yaml -type f \
+              ! -path '*/build/*' \
+              ! -path '*/.dart_tool/*' \
+              | head -n 1
+          )"
+
+          if [ -z "$PUBSPEC_PATH" ]; then
+            echo "pubspec.yaml not found. This ZIP does not contain a Flutter project."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PUBSPEC_PATH")"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+          echo "Flutter project directory: $PROJECT_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter --version
+          flutter doctor -v
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+
+      - name: Clean project
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter clean
+          flutter pub get
+
+      - name: Build release APK
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build apk --release --no-shrink \
+            --build-name="${{ github.event.inputs.build_name }}" \
+            --build-number="${{ github.event.inputs.build_number }}"
+
+      - name: Build release AAB
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build appbundle --release --no-shrink \
+            --build-name="${{ github.event.inputs.build_name }}" \
+            --build-number="${{ github.event.inputs.build_number }}"
+
+      - name: Collect outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf release_outputs
+          mkdir -p release_outputs
+
+          ZIP_BASE="$(basename "$ZIP_FILE" .zip)"
+
+          APK_PATH="$(find "$PROJECT_DIR/build/app/outputs/flutter-apk" -name '*.apk' -type f | head -n 1 || true)"
+          AAB_PATH="$(find "$PROJECT_DIR/build/app/outputs/bundle/release" -name '*.aab' -type f | head -n 1 || true)"
+
+          if [ -z "$APK_PATH" ]; then
+            echo "APK output not found."
+            exit 1
+          fi
+
+          if [ -z "$AAB_PATH" ]; then
+            echo "AAB output not found."
+            exit 1
+          fi
+
+          cp "$APK_PATH" "release_outputs/${ZIP_BASE}-release.apk"
+          cp "$AAB_PATH" "release_outputs/${ZIP_BASE}-release.aab"
+
+          echo "Generated outputs:"
+          ls -lh release_outputs
+
+      - name: Upload release outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-release-output
+          path: release_outputs/*
+          if-no-files-found: error
